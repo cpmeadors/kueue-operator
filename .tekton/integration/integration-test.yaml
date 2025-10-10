@@ -1,16 +1,15 @@
-kind: Pipeline
+---
 apiVersion: tekton.dev/v1beta1
+kind: Pipeline
 metadata:
-  name: integration-tests
+  name: provision-cluster
 spec:
+  description: |
+    An integration test which provisions an ephemeral Hypershift cluster and obtains a kubeconfig.
   params:
-    - description: 'Snapshot of the application'
+    - description: Snapshot of the application
       name: SNAPSHOT
       default: '{"components": [{"name":"test-app", "containerImage": "quay.io/example/repo:latest"}]}'
-      type: string
-    - description: 'Namespace where the application is running'
-      name: NAMESPACE
-      default: "default"
       type: string
   tasks:
     - name: provision-eaas-space
@@ -35,6 +34,9 @@ spec:
         results:
           - name: clusterName
             value: "$(steps.create-cluster.results.clusterName)"
+        volumes:
+          - name: credentials
+            emptyDir: {}
         steps:
           - name: get-supported-versions
             ref:
@@ -73,12 +75,40 @@ spec:
                 - name: pathInRepo
                   value: stepactions/eaas-create-ephemeral-cluster-hypershift-aws/0.1/eaas-create-ephemeral-cluster-hypershift-aws.yaml
             params:
-              - name: instanceType
-                value: m5.xlarge
               - name: eaasSpaceSecretRef
                 value: $(tasks.provision-eaas-space.results.secretRef)
               - name: version
                 value: "$(steps.pick-version.results.version)"
+              - name: instanceType
+                value: m5.xlarge
+              - name: imageContentSources
+                value: |
+                    - mirrors:
+                        - quay.io/redhat-user-workloads/kueue-operator-tenant/kueue-operator-main
+                      source: registry.redhat.io/kueue/kueue-rhel9-operator
+                    - mirrors:
+                        - quay.io/redhat-user-workloads/kueue-operator-tenant/kueue-operand-main
+                      source: registry.redhat.io/kueue/kueue-rhel9
+                    - mirrors:
+                        - quay.io/redhat-user-workloads/kueue-operator-tenant/kueue-must-gather-main
+                      source: registry.redhat.io/kueue/kueue-must-gather-rhel9
+          - name: get-kubeconfig
+            ref:
+              resolver: git
+              params:
+                - name: url
+                  value: https://github.com/konflux-ci/build-definitions.git
+                - name: revision
+                  value: main
+                - name: pathInRepo
+                  value: stepactions/eaas-get-ephemeral-cluster-credentials/0.1/eaas-get-ephemeral-cluster-credentials.yaml
+            params:
+              - name: eaasSpaceSecretRef
+                value: $(tasks.provision-eaas-space.results.secretRef)
+              - name: clusterName
+                value: "$(steps.create-cluster.results.clusterName)"
+              - name: credentials
+                value: credentials
     - name: integration-tests
       runAfter:
         - provision-cluster
@@ -89,6 +119,7 @@ spec:
       taskSpec:
         params:
         - name: SNAPSHOT
+          type: string
         volumes:
           - name: credentials
             emptyDir: {}
@@ -113,7 +144,7 @@ spec:
               value: "$(tasks.provision-cluster.results.clusterName)"
             - name: credentials
               value: credentials
-        - image: registry.redhat.io/openshift4/ose-cli:latest
+        - image: registry.redhat.io/openshift4/ose-cli-rhel9:v4.20
           resources:
             requests:
               memory: 4Gi
@@ -128,21 +159,31 @@ spec:
             - name: credentials
               mountPath: /credentials
           script: |
-            dnf -y install jq git golang make
+            dnf -y install jq git golang make podman
             echo ${SNAPSHOT} | jq .
             env
 
             OPERATOR_IMAGE=$(echo ${SNAPSHOT} | jq -r '.components[] | select(.name=="kueue-operator-main") | .containerImage')
-            OPERAND_IMAGE=$(echo ${SNAPSHOT} | jq -r '.components[] | select(.name=="kueue-operand-main") | .containerImage')
-            MUSTGATHER_IMAGE=$(echo ${SNAPSHOT} | jq -r '.components[] | select(.name=="kueue-must-gather-image") | .containerImage')
-            SRC_REPO=$(echo ${SNAPSHOT} | jq -r '.components[] | select(.name=="kueue-operator-main") | .source.git.url')
-            SRC_REVISION=$(echo ${SNAPSHOT} | jq -r '.components[] | select(.name=="kueue-operator-main") | .source.git.revision')
-            SRC_BASEDIR=$(basename -s .git $SRC_REPO)
-            NAMESPACE=openshift-kueue-operator
+            if [ "$OPERATOR_IMAGE" == "" ]; then
+              OPERATOR_IMAGE="quay.io/redhat-user-workloads/kueue-operator-tenant/kueue-operator-main:latest"
+            fi
 
-            OPERATOR_IMAGE_ORIGINAL=registry.redhat.io/kueue/kueue-rhel9-operator:latest
-            OPERAND_IMAGE_ORIGINAL=registry.redhat.io/kueue/kueue-rhel9:latest
-            MUSTGATHER_IMAGE_ORIGINAL=registry.redhat.io/kueue/kueue-must-gather-rhel9:latest
+            OPERAND_IMAGE=$(echo ${SNAPSHOT} | jq -r '.components[] | select(.name=="kueue-operand-main") | .containerImage')
+            if [ "$OPERAND_IMAGE" == "" ]; then
+              OPERAND_IMAGE="quay.io/redhat-user-workloads/kueue-operator-tenant/kueue-operand-main:latest"
+            fi
+
+            MUSTGATHER_IMAGE=$(echo ${SNAPSHOT} | jq -r '.components[] | select(.name=="kueue-must-gather-main") | .containerImage')
+            if [ "$MUSTGATHER_IMAGE" == "" ]; then
+              MUSTGATHER_IMAGE="quay.io/redhat-user-workloads/kueue-operator-tenant/kueue-must-gather-main:latest"
+            fi
+
+            SRC_REPO=$(echo ${SNAPSHOT} | jq -r '.components[0].source.git.url')
+            SRC_REVISION=$(echo ${SNAPSHOT} | jq -r '.components[0].source.git.revision')
+
+            SRC_BASEDIR=$(basename -s .git $SRC_REPO)
+
+            NAMESPACE=openshift-kueue-operator
 
             echo "----------------------------"
             echo "Images to be tested:"
@@ -154,21 +195,42 @@ spec:
             git clone $SRC_REPO
             pushd $SRC_BASEDIR
             git checkout $SRC_REVISION
-            make deploy-upstream-cert-manager
 
-            TMPDIR=$(mktemp -d)
-            cp -r deploy ${TMPDIR}
-            pushd $TMPDIR
+            # write out a new related_images.json using OPERATOR_* values
+            cat << EOF > related_images.json 
+            [
+              {
+                "name": "operator",
+                "image": "${OPERATOR_IMAGE}"
+              },
+              {
+                "name": "must-gather",
+                "image": "${MUSTGATHER_IMAGE}"
+              },
+              {
+                "name": "operand",
+                "image": "${OPERAND_IMAGE}"
+              }
+            ]
+            EOF
 
-            sed -i "s|${OPERATOR_IMAGE_ORIGINAL}.*|${OPERATOR_IMAGE}|g" deploy/07_deployment.yaml
-            sed -i "s|${OPERAND_IMAGE_ORIGINAL}.*|${OPERAND_IMAGE}|g" deploy/07_deployment.yaml
-            if [ -n "${MUSTGATHER_IMAGE}" ]; then
-              sed -i "s|${MUSTGATHER_IMAGE_ORIGINAL}.*|${MUSTGATHER_IMAGE}|g" deploy/07_deployment.yaml
-            fi
+            # Required for podman/buildah in rootless container
+            echo 'root:1:4294967294' | tee -a /etc/subuid >>/etc/subgid
+
+            # build bundle with references to PR images
+            BUILD_CMD="podman build -f bundle.Dockerfile -t quay.io/cmeadors/kueue-bundle:pr-test"
+            unshare -Uf --keep-caps -r --map-user=1 -w /var/workdir sh -c "${BUILD_CMD}"
+
+            # push image to cluster
+            make bundle-push
+
+            make deploy-cert-manager
 
             oc create ns ${NAMESPACE}
-            oc apply -f deploy/
-            oc apply -f deploy/crd
+
+            # install operator with new bundle
+            operator-sdk run bundle $(BUNDLE_IMAGE) -n $(NAMESPACE)
+
             popd
 
             # wait for operator
